@@ -94,6 +94,12 @@ code, the actual installed CLI was inspected and exercised directly:
   from that check: `EMBEDDING_CONTEXT_LENGTH` is a **character** count passed
   to the embedding model, while `INFERENCE_CONTEXT_LENGTH` is a **token**
   count passed to the text-inference model — don't confuse the two.
+- Re-checked in a later corrective pass: there is still no `--max-tokens` /
+  `--temperature` / `--stop` flag of any kind in `--help`, and the
+  undocumented `--settings '{"maxOutputTokens": N}'` path was tried against
+  a long-form prompt and had **zero effect** (the model ignored it and
+  generated ~7.7k output tokens anyway). See §5 "OpenAI parameters accepted
+  but currently ignored".
 
 ## 3. Repository layout
 
@@ -111,8 +117,37 @@ tests/               pytest suite (unit, mocked -- never calls real Claude)
 scripts/test_openai_client.py   Smoke test using the official `openai` SDK
 Dockerfile
 docker-compose.yml
+pyproject.toml       Dependency ranges + project metadata
+uv.lock              Exact, hash-pinned dependency versions (see below)
 .env.example
 ```
+
+### Reproducible builds (`uv.lock`)
+
+`pyproject.toml` declares version *ranges* (intent); `uv.lock` pins the
+*exact* resolved versions, with hashes, that `docker compose build` actually
+installs -- so a build today and a build in six months install byte-identical
+dependencies until the lock file is regenerated on purpose.
+
+The Dockerfile installs from the lock file with
+[`uv`](https://docs.astral.sh/uv/) (`uv sync --locked`, which fails the build
+if `pyproject.toml` and `uv.lock` have drifted apart), copying the static,
+pinned `uv` binary from `ghcr.io/astral-sh/uv` -- no extra runtime dependency
+ends up in the final image.
+
+To intentionally update dependency versions:
+
+```bash
+# install uv locally: https://docs.astral.sh/uv/getting-started/installation/
+uv lock -P fastapi          # bump one package, or
+uv lock --upgrade           # bump everything to the latest allowed by pyproject.toml
+git diff uv.lock            # review before committing
+docker compose build        # verify the new lock still builds
+```
+
+`uv.lock` is committed to the repo; `pyproject.toml`'s own metadata and
+ranges are untouched by this -- it stays the human-edited source of intent,
+`uv.lock` is the machine-generated source of truth for builds.
 
 ## 4. Deployment
 
@@ -297,8 +332,54 @@ Don't default to Claude's maximum context window — three tags don't need
 tens of thousands of tokens, though a long summary may need more than a
 short tag list. Start modest (e.g. a few thousand tokens for
 `INFERENCE_CONTEXT_LENGTH`, a few hundred for `INFERENCE_MAX_OUTPUT_TOKENS`)
-and raise only if truncation is observed. These are Karakeep-side settings;
-this proxy does not cap or rewrite them (see §8 on ignored parameters).
+and raise only if truncation is observed.
+
+**Important:** these are Karakeep-side settings only. Setting
+`INFERENCE_MAX_OUTPUT_TOKENS=1024` on the Karakeep side does **not** make
+this proxy enforce a 1024-token cap on Claude Code's output — see the next
+section for why.
+
+### OpenAI parameters accepted but currently ignored
+
+The request schema accepts the following OpenAI fields (so the SDK never
+errors on them), but **none of them are currently mapped to a Claude Code
+CLI equivalent** — they are parsed, validated for type, and then dropped:
+
+```text
+temperature
+top_p
+max_tokens
+max_completion_tokens
+frequency_penalty
+presence_penalty
+seed
+stop
+```
+
+This was re-checked directly against the installed **Claude Code 2.1.292**
+CLI for this corrective pass, both from `--help` and empirically:
+
+- `claude --help` / `claude -p --help` expose no `--max-tokens`,
+  `--max-output-tokens`, `--temperature`, or `--stop` flag of any kind.
+- `--settings '{"maxOutputTokens": 20}'` was tried against a prompt designed
+  to produce a long response: Claude Code ignored it and generated **7773
+  output tokens** regardless (its own reported `maxOutputTokens` for the
+  model stayed `128000`). So even the undocumented `--settings` JSON path is
+  not a reliable lever for this — it was not adopted.
+
+Conclusion: there is currently no officially documented, reliable way to
+cap `-p` output length from outside the model's own judgment. Rather than
+fabricate a pseudo-limit (e.g. post-hoc truncation, or stuffing "keep your
+answer under N tokens" into the prompt), the proxy accepts these parameters
+and ignores them honestly. If a future Claude Code release adds a real flag
+for this, map it here and add a test — don't invent a workaround in the
+meantime.
+
+In practice this mostly matters for `max_tokens`/`max_completion_tokens`:
+Claude will size its answer to the instruction (e.g. "return 3 tags") rather
+than to an arbitrary cap, which is usually fine for Karakeep's tagging/
+summary use case; if you see runaway-length responses, control it via your
+prompt/instruction wording rather than these fields.
 
 ## 6. API surface
 
@@ -358,7 +439,9 @@ answers `/v1/chat/completions` and `/v1/models`.
   integration.
 - OpenAI parameters without a clean Claude Code equivalent
   (`temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `stop`,
-  `seed`, `frequency_penalty`, `presence_penalty`) are accepted but ignored.
+  `seed`, `frequency_penalty`, `presence_penalty`) are accepted but ignored —
+  see §5 "OpenAI parameters accepted but currently ignored" for what was
+  checked before reaching that conclusion.
 - `usage` (token counts) is omitted rather than fabricated, since Claude
   Code's JSON envelope doesn't expose prompt/completion token counts in a
   form worth trusting.
@@ -374,11 +457,15 @@ answers `/v1/chat/completions` and `/v1/models`.
 - Claude Code gets no tools, no MCP, no project/user config, no interactive
   permission prompts, and runs from an empty `/app/runtime` with no
   repository, `CLAUDE.md`, plugins, or MCP config mounted in.
-- Bookmark/user content is wrapped in `<conversation>...</conversation>`,
-  explicitly marked untrusted, and instructed never to be treated as
-  commands — this is pure prompt hygiene, not a security boundary by itself;
-  the real boundary is that Claude has no tools to act on an injected
-  instruction even if it tried.
+- `user` message content is **not** wrapped in a "don't follow these
+  instructions" note: Karakeep's `user` message is its real inference
+  instruction (generate tags, summarize, in language X, format Y), and
+  treating it as adversarial by default broke that. The actual boundary
+  against a hostile bookmark is that Claude has no tools to act on an
+  injected instruction even if it tried — not a textual disclaimer around
+  the content. See `app/openai_adapter.py::build_claude_prompt` and
+  `tests/test_chat.py` (`test_karakeep_instruction_survives_injected_bookmark_content`)
+  for the reasoning and the regression test.
 - The proxy never fetches a URL found in message content (no SSRF surface).
 - Runs as a non-root user, `no-new-privileges`, all Linux capabilities
   dropped, read-only root filesystem with `tmpfs` for the few directories
