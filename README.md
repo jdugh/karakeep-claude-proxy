@@ -17,7 +17,8 @@ Ollama** with `qwen3-embedding:0.6b`.
                          │  FastAPI / Python   │
                          └──────────┬──────────┘
                                     │
-                         claude -p  │  (no tools, no MCP, stdin only)
+                         claude -p  │  (no MCP, stdin only; no tools by
+                                    │   default, optionally web search/fetch)
                                     ▼
                          ┌─────────────────────┐
                          │    Claude Code      │
@@ -40,9 +41,13 @@ modify Karakeep or Ollama, and is **not** exposed to the Internet.
   prompt and runs `claude -p --output-format json ...` as a subprocess, with
   the prompt sent over **stdin** (never as a shell argument).
 - Claude Code is invoked with **no tools, no MCP, no project config, no
-  interactive permission prompts**: `--tools "" --disallowedTools "mcp__*"
-  --permission-prompts none --setting-sources ""`. It cannot run shell
-  commands, read/write files, use git, or reach MCP servers.
+  interactive permission prompts** by default: `--tools "" --disallowedTools
+  "mcp__*" --permission-prompts none --setting-sources ""`. It cannot run
+  shell commands, read/write files, use git, or reach MCP servers. Setting
+  `CLAUDE_ENABLE_WEB_TOOLS=true` additionally exposes and pre-authorizes
+  *only* `WebSearch` and `WebFetch` (`--tools "WebSearch,WebFetch"
+  --allowedTools "WebSearch,WebFetch"`) — MCP, every other built-in tool, and
+  `--dangerously-skip-permissions` stay off regardless; see §5.
 - `response_format.type=json_schema` / `json_object` is translated to Claude
   Code's `--json-schema <schema>` flag; the resulting `structured_output`
   object is serialized back into `choices[0].message.content` as a JSON
@@ -100,6 +105,18 @@ code, the actual installed CLI was inspected and exercised directly:
   a long-form prompt and had **zero effect** (the model ignored it and
   generated ~7.7k output tokens anyway). See §5 "OpenAI parameters accepted
   but currently ignored".
+- `--tools "WebSearch,WebFetch"` combined with `--allowedTools
+  "WebSearch,WebFetch"` was verified both for CLI acceptance and for real
+  behavior: run with `--output-format stream-json --verbose`, the trace
+  showed genuine `tool_use` blocks (`WebFetch` against the npm registry,
+  `WebSearch` against a real search backend) with real `tool_result` content
+  feeding the final answer — not just a URL mentioned in text. The system
+  init line confirmed `"tools":["WebFetch","WebSearch"]` and
+  `"mcp_servers":[]`: nothing else was ever on offer. The same flags were
+  then confirmed compatible with `--output-format json` (what `ClaudeRunner`
+  actually uses) and with `--json-schema` in the same call — the final
+  envelope shape (`result`/`structured_output`/`is_error`) is unchanged
+  either way, so no parsing logic needed to change, only argv construction.
 
 ## 3. Repository layout
 
@@ -309,6 +326,7 @@ not implement `/v1/embeddings` on purpose (see §7).
 | `MAX_RETRIES` | `0` | Reserved; no retry logic is implemented in V1 (quota errors must never be retried silently). |
 | `LOG_LEVEL` | `INFO` | Never logs prompt/message content regardless of level. |
 | `ENABLE_TEST_CLAUDE_ENDPOINT` | `false` | Enables `POST /internal/test-claude` (auth-protected, costs quota). |
+| `CLAUDE_ENABLE_WEB_TOOLS` | `false` | See "Web tools" below. Recreate the container after changing. |
 
 Your model subscription may not grant access to every alias in
 `MODEL_MAP` — only the aliases you list are *accepted*, not guaranteed to
@@ -325,6 +343,31 @@ Proxy     CLAUDE_TIMEOUT_SEC=180   (proxy waiting for the `claude` subprocess)
 
 Keep Karakeep's timeout comfortably above the proxy's, so the proxy always
 has a chance to return a clean `504` before Karakeep gives up first.
+
+### Web tools (`CLAUDE_ENABLE_WEB_TOOLS`)
+
+Off by default: Claude gets no tools at all, same as before. Set
+`CLAUDE_ENABLE_WEB_TOOLS=true` and recreate the container to additionally
+expose and pre-authorize **only** `WebSearch` and `WebFetch` — no other
+built-in tool (Bash, Read, Write, Edit, ...), no MCP, and no interactive
+permission prompt is ever introduced by this flag; `--dangerously-skip-permissions`
+is never used either way. See `app/claude_runner.py::ClaudeRunner.run` for
+the exact argv this toggles.
+
+- **What it's for:** letting Claude look something up (confirm a fact, fetch
+  a linked page) while generating a tag or summary, when the instruction in
+  the request calls for it.
+- **It does not force a search.** Enabling the flag only makes the tools
+  *available* — Claude decides whether to use them based on the request it
+  receives; Karakeep doesn't need any change to benefit or to keep working
+  exactly as before.
+- **Cost/latency:** a web lookup adds real latency (often several seconds)
+  and consumes your Claude subscription's usage/quota on top of the
+  inference call itself.
+- **Data exposure:** `WebSearch` sends search terms derived from the request
+  content (which may include bookmark text) to a search provider, and
+  `WebFetch` retrieves whatever page it's pointed at. Don't enable this if
+  that's not acceptable for your content.
 
 ### `INFERENCE_CONTEXT_LENGTH` / `INFERENCE_MAX_OUTPUT_TOKENS`
 
@@ -448,22 +491,33 @@ answers `/v1/chat/completions` and `/v1/models`.
 - The Docker image is ~875 MB because the official Claude Code CLI is an npm
   package and needs a Node.js runtime alongside Python; this trades image
   size for a pinned, reproducible install.
+- With `CLAUDE_ENABLE_WEB_TOOLS=true`, a request can trigger extra Claude
+  turns (search, fetch, synthesize) inside the same `claude -p` call, which
+  can approach `CLAUDE_TIMEOUT_SEC` for non-trivial lookups and spends more
+  quota than a tool-less call; consider raising the timeout if you enable it.
 
 ## 9. Security posture
 
 - `shell=True` is never used; `asyncio.create_subprocess_exec` only, argv as
   a list, the prompt travels over stdin exclusively (never interpolated into
   argv or a shell string) — verified by both tests and a direct source scan.
-- Claude Code gets no tools, no MCP, no project/user config, no interactive
-  permission prompts, and runs from an empty `/app/runtime` with no
-  repository, `CLAUDE.md`, plugins, or MCP config mounted in.
-- `user` message content is **not** wrapped in a "don't follow these
+- Claude Code gets **no tools by default**, no MCP ever, no project/user
+  config, no interactive permission prompts, and runs from an empty
+  `/app/runtime` with no repository, `CLAUDE.md`, plugins, or MCP config
+  mounted in. `CLAUDE_ENABLE_WEB_TOOLS=true` is the one configurable
+  exception: it adds exactly `WebSearch`/`WebFetch`, pre-authorized, nothing
+  else — see §5 "Web tools". MCP, every other built-in tool (Bash, Read,
+  Write, Edit, ...), and `--dangerously-skip-permissions` are never affected
+  by that flag.
+- The proxy preserves OpenAI `system`/`user`/`assistant` semantics as-is;
+  `user` message content is **not** wrapped in a "don't follow these
   instructions" note: Karakeep's `user` message is its real inference
   instruction (generate tags, summarize, in language X, format Y), and
-  treating it as adversarial by default broke that. The actual boundary
-  against a hostile bookmark is that Claude has no tools to act on an
-  injected instruction even if it tried — not a textual disclaimer around
-  the content. See `app/openai_adapter.py::build_claude_prompt` and
+  treating it as adversarial by default broke that. Security against
+  malicious bookmark content relies primarily on disabling Claude Code's
+  tools/MCP/filesystem access by default (and, even with web tools on,
+  never granting anything beyond search/fetch) — not on a textual
+  disclaimer around the content. See `app/openai_adapter.py::build_claude_prompt` and
   `tests/test_chat.py` (`test_karakeep_instruction_survives_injected_bookmark_content`)
   for the reasoning and the regression test.
 - The proxy never fetches a URL found in message content (no SSRF surface).

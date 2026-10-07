@@ -18,16 +18,16 @@ from app.claude_runner import (
 from app.config import load_settings
 
 
-def _settings():
-    return load_settings(
-        {
-            "PROXY_API_KEY": "k",
-            "CLAUDE_CODE_OAUTH_TOKEN": "t",
-            "MODEL_MAP": "claude-sonnet=sonnet",
-            "DEFAULT_MODEL": "claude-sonnet",
-            "CLAUDE_TIMEOUT_SEC": "5",
-        }
-    )
+def _settings(**overrides):
+    env = {
+        "PROXY_API_KEY": "k",
+        "CLAUDE_CODE_OAUTH_TOKEN": "t",
+        "MODEL_MAP": "claude-sonnet=sonnet",
+        "DEFAULT_MODEL": "claude-sonnet",
+        "CLAUDE_TIMEOUT_SEC": "5",
+    }
+    env.update(overrides)
+    return load_settings(env)
 
 
 class FakeStreamWriter:
@@ -102,6 +102,82 @@ async def test_successful_text_response(runner_with_fake_process):
     assert process.stdin.closed
     assert "--tools" in argv and "" in argv  # --tools "" present somewhere
     assert "--json-schema" not in argv
+
+
+def _flag_value(argv: list[str], flag: str) -> str:
+    return argv[argv.index(flag) + 1]
+
+
+async def test_web_tools_disabled_by_default(runner_with_fake_process):
+    """CLAUDE_ENABLE_WEB_TOOLS absent or false: unchanged -- no tools at all."""
+    envelope = {"is_error": False, "result": "OK"}
+    process = FakeProcess(stdout=json.dumps(envelope).encode())
+    argv = runner_with_fake_process(process)
+
+    runner = ClaudeRunner(_settings(CLAUDE_ENABLE_WEB_TOOLS="false"))
+    await runner.run(prompt="hi", model="sonnet", json_schema=None)
+
+    assert _flag_value(argv, "--tools") == ""
+    assert "--allowedTools" not in argv
+    assert _flag_value(argv, "--disallowedTools") == "mcp__*"
+
+
+async def test_web_tools_enabled_exposes_only_websearch_and_webfetch(runner_with_fake_process):
+    envelope = {"is_error": False, "result": "OK"}
+    process = FakeProcess(stdout=json.dumps(envelope).encode())
+    argv = runner_with_fake_process(process)
+
+    runner = ClaudeRunner(_settings(CLAUDE_ENABLE_WEB_TOOLS="true"))
+    await runner.run(prompt="hi", model="sonnet", json_schema=None)
+
+    assert _flag_value(argv, "--tools") == "WebSearch,WebFetch"
+    assert _flag_value(argv, "--allowedTools") == "WebSearch,WebFetch"
+    # no other built-in tool, and never an unattended bypass of permissions
+    for forbidden in ("Bash", "Read", "Write", "Edit"):
+        assert forbidden not in _flag_value(argv, "--tools").split(",")
+    assert "--dangerously-skip-permissions" not in argv
+    assert "--allow-dangerously-skip-permissions" not in argv
+
+
+async def test_web_tools_enabled_still_disallows_mcp_and_prompts(runner_with_fake_process):
+    envelope = {"is_error": False, "result": "OK"}
+    process = FakeProcess(stdout=json.dumps(envelope).encode())
+    argv = runner_with_fake_process(process)
+
+    runner = ClaudeRunner(_settings(CLAUDE_ENABLE_WEB_TOOLS="true"))
+    await runner.run(prompt="hi", model="sonnet", json_schema=None)
+
+    assert _flag_value(argv, "--disallowedTools") == "mcp__*"
+    assert _flag_value(argv, "--permission-prompts") == "none"
+    assert _flag_value(argv, "--setting-sources") == ""
+    assert "--disable-slash-commands" in argv
+    assert "--no-session-persistence" in argv
+
+
+async def test_web_tools_enabled_still_compatible_with_json_schema(runner_with_fake_process):
+    schema = {"type": "object", "properties": {"tags": {"type": "array"}}}
+    envelope = {"is_error": False, "result": '{"tags":[]}', "structured_output": {"tags": []}}
+    process = FakeProcess(stdout=json.dumps(envelope).encode())
+    argv = runner_with_fake_process(process)
+
+    runner = ClaudeRunner(_settings(CLAUDE_ENABLE_WEB_TOOLS="true"))
+    result = await runner.run(prompt="hi", model="sonnet", json_schema=schema)
+
+    assert _flag_value(argv, "--json-schema") == json.dumps(schema)
+    assert result.structured == {"tags": []}
+
+
+async def test_web_tools_flag_does_not_alter_the_prompt_sent_to_claude(runner_with_fake_process):
+    """Enabling web tools must never rewrite, prefix, or otherwise touch the
+    prompt -- only the tool-related argv flags change."""
+    envelope = {"is_error": False, "result": "OK"}
+    process = FakeProcess(stdout=json.dumps(envelope).encode())
+    runner_with_fake_process(process)
+
+    runner = ClaudeRunner(_settings(CLAUDE_ENABLE_WEB_TOOLS="true"))
+    await runner.run(prompt="Résume cet article en français.", model="sonnet", json_schema=None)
+
+    assert process.stdin.written == "Résume cet article en français.".encode("utf-8")
 
 
 async def test_structured_output_is_parsed(runner_with_fake_process):

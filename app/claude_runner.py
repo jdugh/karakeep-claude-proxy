@@ -3,9 +3,16 @@
 Security invariants (see PROMPT.md section 3.3 / 13):
 - the subprocess is never run through a shell; argv is always a list and the
   prompt is always sent via stdin, never interpolated into argv;
-- Claude is given no tools (`--tools ""`), no MCP (`--disallowedTools mcp__*`),
-  no project config (`--setting-sources ""`), and no interactive permission
-  prompts (`--permission-prompts none`);
+- by default Claude is given no tools at all (`--tools ""`). If
+  `settings.claude_enable_web_tools` is set (`CLAUDE_ENABLE_WEB_TOOLS=true`),
+  exactly `WebSearch` and `WebFetch` are made available and pre-authorized
+  (`--tools "WebSearch,WebFetch" --allowedTools "WebSearch,WebFetch"`), so
+  Claude can use them without an interactive permission prompt. No other
+  built-in tool (Bash, Read, Write, Edit, ...) is ever enabled this way, and
+  `--dangerously-skip-permissions` is never used;
+- MCP is always disabled (`--disallowedTools "mcp__*"`), regardless of the
+  web-tools setting, as is project/user config (`--setting-sources ""`) and
+  interactive permission prompts (`--permission-prompts none`);
 - every invocation is bounded by a timeout and a hard cap on stdout/stderr
   size, and the subprocess is always killed/reaped, even on timeout or
   cancellation.
@@ -126,12 +133,20 @@ class ClaudeRunner:
 
         timeout = timeout_sec if timeout_sec is not None else settings.claude_timeout_sec
 
+        if settings.claude_enable_web_tools:
+            tool_args = [
+                "--tools", "WebSearch,WebFetch",
+                "--allowedTools", "WebSearch,WebFetch",
+            ]
+        else:
+            tool_args = ["--tools", ""]
+
         argv = [
             binary,
             "-p",
             "--output-format", "json",
             "--model", model,
-            "--tools", "",
+            *tool_args,
             "--disallowedTools", "mcp__*",
             "--permission-prompts", "none",
             "--setting-sources", "",

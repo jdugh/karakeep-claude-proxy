@@ -29,15 +29,15 @@ def _parse_model_map(raw: str) -> dict[str, str]:
     return mapping
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    val = os.environ.get(name)
+def _env_bool(env: dict[str, str], name: str, default: bool) -> bool:
+    val = env.get(name)
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _env_int(name: str, default: int) -> int:
-    val = os.environ.get(name)
+def _env_int(env: dict[str, str], name: str, default: int) -> int:
+    val = env.get(name)
     if val is None or not val.strip():
         return default
     try:
@@ -59,7 +59,8 @@ class Settings:
     max_retries: int
     log_level: str
     enable_test_claude_endpoint: bool
-    permission_mode: str = "none"  # fixed: Claude is never granted tool access
+    claude_enable_web_tools: bool
+    permission_mode: str = "none"  # fixed: Claude never gets an interactive permission prompt
 
     def resolve_model(self, requested: str) -> str | None:
         return self.model_map.get(requested)
@@ -91,12 +92,13 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         claude_binary=claude_binary,
         default_model=default_model,
         model_map=model_map,
-        claude_timeout_sec=_env_int("CLAUDE_TIMEOUT_SEC", 180),
-        max_concurrent_requests=_env_int("MAX_CONCURRENT_REQUESTS", 1),
-        max_request_body_bytes=_env_int("MAX_REQUEST_BODY_BYTES", 2 * 1024 * 1024),
-        max_retries=_env_int("MAX_RETRIES", 0),
+        claude_timeout_sec=_env_int(e, "CLAUDE_TIMEOUT_SEC", 180),
+        max_concurrent_requests=_env_int(e, "MAX_CONCURRENT_REQUESTS", 1),
+        max_request_body_bytes=_env_int(e, "MAX_REQUEST_BODY_BYTES", 2 * 1024 * 1024),
+        max_retries=_env_int(e, "MAX_RETRIES", 0),
         log_level=e.get("LOG_LEVEL", "INFO").upper(),
-        enable_test_claude_endpoint=_env_bool("ENABLE_TEST_CLAUDE_ENDPOINT", False),
+        enable_test_claude_endpoint=_env_bool(e, "ENABLE_TEST_CLAUDE_ENDPOINT", False),
+        claude_enable_web_tools=_env_bool(e, "CLAUDE_ENABLE_WEB_TOOLS", False),
     )
 
 
