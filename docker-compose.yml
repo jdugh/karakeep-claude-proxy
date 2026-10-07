@@ -9,6 +9,14 @@ services:
     env_file:
       - .env
 
+    # Optional: customize the CLAUDE_ENABLE_WEB_TOOLS search-guidance prompt
+    # without rebuilding the image. The image already ships a default at
+    # /app/prompts/web-tools.txt, so this is NOT required to use web tools.
+    # Mount the directory (not the single file) so editor saves that use
+    # atomic rename-and-replace are picked up correctly:
+    #   volumes:
+    #     - ./prompts:/app/prompts:ro
+
     # Internal only: Karakeep reaches this over the shared Docker network
     # at http://claude-proxy:8080/v1. No host port is published, and this
     # must never sit behind Traefik or any other public ingress.

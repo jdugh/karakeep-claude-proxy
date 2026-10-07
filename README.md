@@ -327,6 +327,7 @@ not implement `/v1/embeddings` on purpose (see §7).
 | `LOG_LEVEL` | `INFO` | Never logs prompt/message content regardless of level. |
 | `ENABLE_TEST_CLAUDE_ENDPOINT` | `false` | Enables `POST /internal/test-claude` (auth-protected, costs quota). |
 | `CLAUDE_ENABLE_WEB_TOOLS` | `false` | See "Web tools" below. Recreate the container after changing. |
+| `CLAUDE_WEB_PROMPT_FILE` | `/app/prompts/web-tools.txt` | Only read when `CLAUDE_ENABLE_WEB_TOOLS=true`. See "Web tools" below. |
 
 Your model subscription may not grant access to every alias in
 `MODEL_MAP` — only the aliases you list are *accepted*, not guaranteed to
@@ -344,7 +345,7 @@ Proxy     CLAUDE_TIMEOUT_SEC=180   (proxy waiting for the `claude` subprocess)
 Keep Karakeep's timeout comfortably above the proxy's, so the proxy always
 has a chance to return a clean `504` before Karakeep gives up first.
 
-### Web tools (`CLAUDE_ENABLE_WEB_TOOLS`)
+### Web tools (`CLAUDE_ENABLE_WEB_TOOLS`, `CLAUDE_WEB_PROMPT_FILE`)
 
 Off by default: Claude gets no tools at all, same as before. Set
 `CLAUDE_ENABLE_WEB_TOOLS=true` and recreate the container to additionally
@@ -354,13 +355,49 @@ permission prompt is ever introduced by this flag; `--dangerously-skip-permissio
 is never used either way. See `app/claude_runner.py::ClaudeRunner.run` for
 the exact argv this toggles.
 
+When web tools are on, the proxy also appends a search-guidance instruction
+via `--append-system-prompt` (argv, not stdin) telling Claude *when* it
+should actually use those tools — enabling the tools alone doesn't tell
+Claude to prefer searching. That instruction's text lives in a plain UTF-8
+file, not hardcoded:
+
+- **`CLAUDE_WEB_PROMPT_FILE`** (default `/app/prompts/web-tools.txt`) points
+  to it. The repo ships [`prompts/web-tools.txt`](prompts/web-tools.txt) with
+  a ready-to-use instruction, baked into the Docker image at that exact
+  default path — web mode works out of the box with **no extra volume
+  mount**.
+- **It is re-read on every request**, not cached, so editing the mounted
+  file takes effect on the very next call — no proxy restart needed.
+  Changing the `CLAUDE_WEB_PROMPT_FILE` *path* itself is an env var change
+  and does need `docker compose up -d` to recreate the container, same as
+  any other setting here.
+- **To customize it** on your VPS: copy the shipped file out, edit it, then
+  mount the *directory* (not the single file) read-only in
+  `docker-compose.yml`:
+  ```yaml
+  volumes:
+    - ./prompts:/app/prompts:ro
+  ```
+  Mounting the directory rather than one file matters: editors and sync
+  tools that save via atomic rename-and-replace swap the file's inode,
+  which breaks a single-file bind mount but not a directory mount. This is
+  commented out in `docker-compose.yml` by default — it is optional, not
+  required to use web tools.
+- **Error handling is intentionally strict, not silent.** If
+  `CLAUDE_ENABLE_WEB_TOOLS=true` and the file is missing, unreadable, or
+  empty: the proxy refuses to start (clear error in
+  `docker compose logs`), and if the file disappears *after* a successful
+  start, the affected request gets a clean `503` instead of silently
+  running without the intended guidance.
+
 - **What it's for:** letting Claude look something up (confirm a fact, fetch
   a linked page) while generating a tag or summary, when the instruction in
   the request calls for it.
-- **It does not force a search.** Enabling the flag only makes the tools
-  *available* — Claude decides whether to use them based on the request it
-  receives; Karakeep doesn't need any change to benefit or to keep working
-  exactly as before.
+- **It does not guarantee a search happened.** The tools being available
+  and the file's instruction nudging Claude toward using them is not a
+  technical guarantee — Claude still decides, and nothing here verifies or
+  retries based on whether a search actually occurred. Karakeep doesn't
+  need any change to benefit or to keep working exactly as before.
 - **Cost/latency:** a web lookup adds real latency (often several seconds)
   and consumes your Claude subscription's usage/quota on top of the
   inference call itself.

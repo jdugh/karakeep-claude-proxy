@@ -7,9 +7,14 @@ Security invariants (see PROMPT.md section 3.3 / 13):
   `settings.claude_enable_web_tools` is set (`CLAUDE_ENABLE_WEB_TOOLS=true`),
   exactly `WebSearch` and `WebFetch` are made available and pre-authorized
   (`--tools "WebSearch,WebFetch" --allowedTools "WebSearch,WebFetch"`), so
-  Claude can use them without an interactive permission prompt. No other
-  built-in tool (Bash, Read, Write, Edit, ...) is ever enabled this way, and
-  `--dangerously-skip-permissions` is never used;
+  Claude can use them without an interactive permission prompt. The content
+  of `settings.claude_web_prompt_file` (default
+  `/app/prompts/web-tools.txt`, re-read fresh on every request, never
+  cached) is appended via `--append-system-prompt` (argv, never shell/stdin)
+  telling Claude when to use them -- this only nudges behavior, it grants
+  nothing by itself. No other built-in tool (Bash, Read, Write, Edit, ...)
+  is ever enabled this way, and `--dangerously-skip-permissions` is never
+  used;
 - MCP is always disabled (`--disallowedTools "mcp__*"`), regardless of the
   web-tools setting, as is project/user config (`--setting-sources ""`) and
   interactive permission prompts (`--permission-prompts none`);
@@ -24,6 +29,7 @@ import asyncio.subprocess
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from app.config import Settings, claude_binary_path
@@ -63,6 +69,30 @@ class ClaudeUpstreamError(ClaudeRunnerError):
         super().__init__(message)
         self.api_error_status = api_error_status
         self.is_rate_limited = is_rate_limited
+
+
+class WebPromptFileError(ClaudeRunnerError):
+    """CLAUDE_WEB_PROMPT_FILE is missing, unreadable, or empty while
+    CLAUDE_ENABLE_WEB_TOOLS=true. Raised both at startup (fail fast) and,
+    if the file disappears later, on the affected request."""
+
+
+def read_web_prompt_file(path: str) -> str:
+    """Reads CLAUDE_WEB_PROMPT_FILE fresh -- no caching, so an edit to a
+    mounted file takes effect on the very next request."""
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise WebPromptFileError(
+            f"CLAUDE_ENABLE_WEB_TOOLS=true but CLAUDE_WEB_PROMPT_FILE {path!r} "
+            f"could not be read: {exc}"
+        ) from exc
+    content = content.strip()
+    if not content:
+        raise WebPromptFileError(
+            f"CLAUDE_ENABLE_WEB_TOOLS=true but CLAUDE_WEB_PROMPT_FILE {path!r} is empty"
+        )
+    return content
 
 
 @dataclass
@@ -134,9 +164,11 @@ class ClaudeRunner:
         timeout = timeout_sec if timeout_sec is not None else settings.claude_timeout_sec
 
         if settings.claude_enable_web_tools:
+            web_prompt = read_web_prompt_file(settings.claude_web_prompt_file)
             tool_args = [
                 "--tools", "WebSearch,WebFetch",
                 "--allowedTools", "WebSearch,WebFetch",
+                "--append-system-prompt", web_prompt,
             ]
         else:
             tool_args = ["--tools", ""]
@@ -155,6 +187,8 @@ class ClaudeRunner:
         ]
         if json_schema is not None:
             argv += ["--json-schema", json.dumps(json_schema)]
+
+        logger.info("Claude invocation: web_tools_enabled=%s", settings.claude_enable_web_tools)
 
         proc = await asyncio.create_subprocess_exec(
             *argv,

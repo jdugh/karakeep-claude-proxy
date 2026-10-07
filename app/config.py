@@ -60,6 +60,7 @@ class Settings:
     log_level: str
     enable_test_claude_endpoint: bool
     claude_enable_web_tools: bool
+    claude_web_prompt_file: str
     permission_mode: str = "none"  # fixed: Claude never gets an interactive permission prompt
 
     def resolve_model(self, requested: str) -> str | None:
@@ -99,6 +100,7 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         log_level=e.get("LOG_LEVEL", "INFO").upper(),
         enable_test_claude_endpoint=_env_bool(e, "ENABLE_TEST_CLAUDE_ENDPOINT", False),
         claude_enable_web_tools=_env_bool(e, "CLAUDE_ENABLE_WEB_TOOLS", False),
+        claude_web_prompt_file=e.get("CLAUDE_WEB_PROMPT_FILE", "/app/prompts/web-tools.txt"),
     )
 
 

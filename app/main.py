@@ -22,6 +22,8 @@ from app.claude_runner import (
     ClaudeRunner,
     ClaudeTimeoutError,
     ClaudeUpstreamError,
+    WebPromptFileError,
+    read_web_prompt_file,
 )
 from app.config import Settings, claude_binary_path, get_settings
 from app.errors import (
@@ -49,6 +51,13 @@ _state: dict[str, str | None] = {"claude_version": None}
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    logger.info("Claude configuration: web_tools_enabled=%s", settings.claude_enable_web_tools)
+    if settings.claude_enable_web_tools:
+        logger.info("Claude web prompt file: %s", settings.claude_web_prompt_file)
+        # Fail fast and explicitly at startup rather than silently running
+        # without the intended search guidance (never caught here: a bad
+        # file must stop the app from starting).
+        read_web_prompt_file(settings.claude_web_prompt_file)
     _state["claude_version"] = await _runner.version()
     if _state["claude_version"]:
         logger.info("Claude Code version: %s", _state["claude_version"])
@@ -189,6 +198,11 @@ async def chat_completions(request: Request, settings: Settings = Depends(get_se
             raise UpstreamTimeoutError(str(exc)) from exc
         except ClaudeExecutableNotFoundError as exc:
             raise ServiceNotReadyError(str(exc)) from exc
+        except WebPromptFileError as exc:
+            logger.error("web_tools_enabled=%s claude_web_prompt_file_error=%s", True, exc)
+            raise ServiceNotReadyError(
+                "Claude web search is enabled but its prompt file is unavailable"
+            ) from exc
         except ClaudeUpstreamError as exc:
             logger.warning(
                 "requested_model=%s resolved_model=%s structured=%s claude_error_status=%s rate_limited=%s",

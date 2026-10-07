@@ -40,6 +40,11 @@ RUN uv sync --locked --no-install-project
 COPY app ./app
 RUN uv sync --locked
 
+# Default CLAUDE_WEB_PROMPT_FILE content, baked in so web mode works with no
+# extra volume mount; override by bind-mounting ./prompts:/app/prompts:ro
+# (see README "Web tools" / docker-compose.yml comment).
+COPY prompts ./prompts
+
 ENV PATH="/app/.venv/bin:${PATH}"
 
 # --- Hermetic, non-root runtime user -------------------------------------
