@@ -1,0 +1,41 @@
+services:
+  claude-proxy:
+    build:
+      context: .
+    image: karakeep-claude-proxy:local
+    container_name: claude-proxy
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    # Internal only: Karakeep reaches this over the shared Docker network
+    # at http://claude-proxy:8080/v1. No host port is published, and this
+    # must never sit behind Traefik or any other public ingress.
+    expose:
+      - "8080"
+
+    networks:
+      - ai-network
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      - /home/app:size=64m
+      - /app/runtime:size=64m
+
+networks:
+  ai-network:
+    external: true
+    name: ${AI_NETWORK_NAME}
